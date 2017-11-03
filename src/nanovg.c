@@ -37,6 +37,9 @@
 #define NVG_INIT_FONTIMAGE_SIZE  512
 #define NVG_MAX_FONTIMAGE_SIZE   2048
 #define NVG_MAX_FONTIMAGES       4
+#define NVG_GRADIENT_WIDTH       256
+#define NVG_INIT_GRADIENT_COUNT  32
+#define NVG_MAX_GRADIENTS        512 // Must be a power of 2.
 
 #define NVG_INIT_COMMANDS_SIZE 256
 #define NVG_INIT_POINTS_SIZE 128
@@ -47,7 +50,7 @@
 #define NVG_KAPPA90 0.5522847493f	// Length proportional to radius of a cubic bezier handle for 90deg arcs.
 
 #define NVG_COUNTOF(arr) (sizeof(arr) / sizeof(0[arr]))
-
+#define NVG_FLOAT_TO_CHAR(f) ((unsigned char) floor(f * 255.0f))
 
 enum NVGcommands {
 	NVG_MOVETO = 0,
@@ -125,10 +128,15 @@ struct NVGcontext {
 	struct FONScontext* fs;
 	int fontImages[NVG_MAX_FONTIMAGES];
 	int fontImageIdx;
+	int gradientImage;
+	int gradientCount;
+	unsigned char gradientImageData[NVG_GRADIENT_WIDTH * NVG_INIT_GRADIENT_COUNT * 4];
 	int drawCallCount;
 	int fillTriCount;
 	int strokeTriCount;
 	int textTriCount;
+	uint8_t* gradientsUsedThisFrame[NVG_MAX_GRADIENTS / 8];
+	uint8_t* gradientsUsedLastFrame[NVG_MAX_GRADIENTS / 8];
 };
 
 static float nvg__sqrtf(float a) { return sqrtf(a); }
@@ -328,6 +336,15 @@ NVGcontext* nvgCreateInternal(NVGparams* params)
 	if (ctx->fontImages[0] == 0) goto error;
 	ctx->fontImageIdx = 0;
 
+	// Create gradient texture
+	ctx->gradientCount = NVG_INIT_GRADIENT_COUNT;
+	memset(&ctx->gradientImageData, 0, NVG_GRADIENT_WIDTH * NVG_INIT_GRADIENT_COUNT * 4);
+
+	*ctx->gradientsUsedThisFrame = (uint8_t*) malloc(NVG_MAX_GRADIENTS / sizeof(uint8_t));
+	*ctx->gradientsUsedLastFrame = (uint8_t*) malloc(NVG_MAX_GRADIENTS / sizeof(uint8_t));
+	ctx->gradientImage = ctx->params.renderCreateTexture(ctx->params.userPtr, NVG_TEXTURE_ALPHA, NVG_GRADIENT_WIDTH, NVG_INIT_GRADIENT_COUNT, 0, NULL);
+	if (ctx->gradientImage == 0) goto error;
+
 	return ctx;
 
 error:
@@ -357,6 +374,15 @@ void nvgDeleteInternal(NVGcontext* ctx)
 		}
 	}
 
+	if (ctx->gradientImage != 0) {
+		nvgDeleteImage(ctx, ctx->gradientImage);
+		ctx->gradientImage = 0;
+	}
+
+	printf("%i\n", ctx->gradientCount);
+	printf("0x%02x", ctx->gradientsUsedThisFrame[ctx->gradientCount - 1]);
+	printf("%s\n", ctx->gradientImageData);
+
 	if (ctx->params.renderDelete != NULL)
 		ctx->params.renderDelete(ctx->params.userPtr);
 
@@ -374,6 +400,8 @@ void nvgBeginFrame(NVGcontext* ctx, int windowWidth, int windowHeight, float dev
 	nvgReset(ctx);
 
 	nvg__setDevicePixelRatio(ctx, devicePixelRatio);
+
+	memset(&ctx->gradientsUsedThisFrame, 0, NVG_MAX_GRADIENTS);
 
 	ctx->params.renderViewport(ctx->params.userPtr, windowWidth, windowHeight, devicePixelRatio);
 
@@ -415,6 +443,11 @@ void nvgEndFrame(NVGcontext* ctx)
 		// clear all images after j
 		for (i = j; i < NVG_MAX_FONTIMAGES; i++)
 			ctx->fontImages[i] = 0;
+
+		// Swap gradient validity fields.
+		uint8_t* tmp = *ctx->gradientsUsedThisFrame;
+		*ctx->gradientsUsedThisFrame = *ctx->gradientsUsedLastFrame;
+		*ctx->gradientsUsedLastFrame = tmp;
 	}
 }
 
@@ -837,6 +870,159 @@ void nvgImageSize(NVGcontext* ctx, int image, int* w, int* h)
 void nvgDeleteImage(NVGcontext* ctx, int image)
 {
 	ctx->params.renderDeleteTexture(ctx->params.userPtr, image);
+}
+
+NVGpaint nvgLinearGradientWithStops(NVGcontext* ctx,
+								  float sx, float sy, float ex, float ey,
+								  NVGcolor* colors, float* stops, int numStops)
+{
+	NVGpaint p;
+	float dx, dy, d;
+	const float large = 1e5;
+	NVG_NOTUSED(ctx);
+	memset(&p, 0, sizeof(p));
+
+	// Calculate transform aligned to the line
+	dx = ex - sx;
+	dy = ey - sy;
+	d = sqrtf(dx*dx + dy*dy);
+	if (d > 0.0001f) {
+		dx /= d;
+		dy /= d;
+	} else {
+		dx = 0;
+		dy = 1;
+	}
+
+	p.xform[0] = dy; p.xform[1] = -dx;
+	p.xform[2] = dx; p.xform[3] = dy;
+	p.xform[4] = sx - dx*large; p.xform[5] = sy - dy*large;
+
+	p.extent[0] = large;
+	p.extent[1] = large + d*0.5f;
+
+	p.radius = 0.0f;
+
+	p.feather = nvg__maxf(1.0f, d);
+
+	int stopPositions[numStops];
+	char stopColors[numStops * 4];
+
+	int i, j;
+	int colorPosition;
+
+	printf("%s\n", "Got Here!");
+
+	// Compute the position & color value of each stop color in a gradient line in the texture.
+	// This is done beforehand to speed lookups.
+	for(i = 0; i < numStops; ++i) {
+		stopPositions[i] = floor(stops[i] * NVG_GRADIENT_WIDTH);
+
+		colorPosition = i * 4;
+		stopColors[colorPosition] = NVG_FLOAT_TO_CHAR(colors[i].r);
+		stopColors[colorPosition + 1] = NVG_FLOAT_TO_CHAR(colors[i].g);
+		stopColors[colorPosition + 2] = NVG_FLOAT_TO_CHAR(colors[i].b);
+		stopColors[colorPosition + 3] = NVG_FLOAT_TO_CHAR(colors[i].a);
+	}
+	printf("%s\n", "Got Here2!");
+
+	int gradientIndex = -1;
+	unsigned char *gradientLine;
+	unsigned char *colorInLine;
+	int maskByte;
+	char maskBit;
+
+	// Search through each gradient line in the texture data.
+	for(i = 0; i < ctx->gradientCount; ++i) {
+		maskByte = i / 8;
+		maskBit = i % 8;
+
+		*(ctx->gradientsUsedThisFrame[0]) = 0xFF;
+		printf("%s\n", "Blap");
+		printf("%i\n", *(ctx->gradientsUsedThisFrame)[maskByte]);
+		// Skip anything that hasn't been used this frame or the previous frame.
+		if(
+			!((*ctx->gradientsUsedThisFrame[maskByte] >> maskBit) & 0x01)
+			|| (!(*ctx->gradientsUsedLastFrame[maskByte] >> maskBit) & 0x01)
+		) continue;
+
+		printf("%s\n", "Got Here 2.2!");
+
+		gradientLine = &ctx->gradientImageData[i * NVG_GRADIENT_WIDTH * 4];
+
+		// Assume each line matches until proven otherwise.
+		gradientIndex = i;
+		for(j = 0; j < numStops; ++j) {
+			colorInLine = &gradientLine[stopPositions[j]];
+
+			if(
+				*colorInLine != stopColors[j]
+				|| *colorInLine + 1 != stopColors[j] + 1
+				|| *colorInLine + 2 != stopColors[j] + 2
+				|| *colorInLine + 3 != stopColors[j] + 3
+			) {
+				gradientIndex = -1;
+				break;
+			};
+		}
+
+		if(gradientIndex == i) {
+			break;
+		}
+	}
+	printf("%s\n", "Got Here3!");
+
+	// If no match was found...
+	if (gradientIndex == -1) {
+		for(i = 0; i < ctx->gradientCount; ++i) {
+			maskByte = i / 8;
+			maskBit = i % 8;
+
+			printf("%i\n", ctx->gradientsUsedThisFrame[maskByte]);
+
+			// Skip anything that has been used this frame or the previous frame.
+			if(
+				((*ctx->gradientsUsedThisFrame[maskByte] >> maskBit) & 0x01)
+				&& (!(*ctx->gradientsUsedLastFrame[maskByte] >> maskBit) & 0x01)
+			) continue;
+
+			gradientLine = &ctx->gradientImageData[i * NVG_GRADIENT_WIDTH * 4];
+
+			// Make all the colors red.
+			for(j = 0; j < NVG_GRADIENT_WIDTH * 4; j += 4) {
+				gradientLine[j] = 0xFF;
+				gradientLine[j + 1] = 0x00;
+				gradientLine[j + 2] = 0x00;
+				gradientLine[j + 3] = 0x00;
+			}
+
+			gradientIndex = i;
+
+			ctx->params.renderUpdateTexture(
+				ctx->params.userPtr, ctx->gradientImage, 0, 0,
+				NVG_GRADIENT_WIDTH, ctx->gradientCount, ctx->gradientImageData
+			);
+
+			break;
+		}
+
+	}
+	printf("%s\n", "Got Here4!");
+
+	// Set the mask for this gradient index so that other gradients don't overwrite it.
+	maskByte = gradientIndex / 8;
+	maskBit = gradientIndex % 8;
+
+	printf("%i\n", gradientIndex);
+	printf("%i\n", maskByte);
+	printf("%i\n", maskBit);
+
+	*ctx->gradientsUsedThisFrame[maskByte] |= (1 << maskBit);
+printf("%s\n", "Got Here4.6!");
+	p.gradientIndex = gradientIndex;
+	printf("%s\n", "Got Here5!");
+
+	return p;
 }
 
 NVGpaint nvgLinearGradient(NVGcontext* ctx,
